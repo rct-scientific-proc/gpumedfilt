@@ -100,6 +100,7 @@ static bool run_tests()
         { 100, 64,  { 3, 5, 7, 9, 13, 17, 25, 63 } },
         { 257, 131, { 3, 5, 7, 9, 11, 15, 21, 31, 101 } },
         { 64,  40,  { 121, 151, 255 } },
+        { 200, 90,  { 201 } },
     };
 
     int failures = 0, checks = 0;
@@ -271,7 +272,7 @@ static void run_npp(int K, int W, int H)
 
 static void run_bench(int W, int H)
 {
-    const int Ks[] = { 3, 5, 7, 9, 11, 15, 21, 31, 201 };
+    const int Ks[] = { 3, 5, 7, 9, 11, 15, 21, 31, 63, 101, 201 };
     const size_t n = (size_t)W * H, bytes = n * sizeof(float);
     const double mpix = n / 1e6;
     printf("\nBenchmark %dx%d float image (%.1f MPix, %.1f MB). Kernel-only times are ms per image; "

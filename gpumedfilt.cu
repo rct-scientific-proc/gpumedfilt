@@ -351,7 +351,201 @@ medfilt_bisect_kernel(const float* __restrict__ in, float* __restrict__ out, int
 }
 
 // ------------------------------------------------------------------------------------------------
-// Kernel 3: fallback for windows that do not fit in shared memory (reads through L1/L2)
+// Kernel 3: huge windows -- sorted columns in global scratch memory, sample table in shared memory
+// ------------------------------------------------------------------------------------------------
+//
+// Same scheme as kernel 2 (incrementally maintained sorted columns, snapping bisection), for windows
+// whose sorted columns no longer fit in shared memory. Persistent blocks of TW threads loop over
+// TW x rows strips; each block owns a private scratch slot holding the sorted column segments
+// column-contiguously (column c, element i at cols[c*KP + i], KP = K rounded up to G, padded with
+// 0xFFFFFFFF). Shared memory holds every G-th element of every column (samp[j*SWs + c] =
+// cols[c*KP + j*G]) plus the column medians. A probe's count(<= probe) per column is then a binary
+// search over the samples in shared memory followed by a single G-element (one or a few 32-byte
+// sectors) read from global memory, instead of log2(K) dependent global loads.
+
+// Merge sort of a[0..K) using tmp[0..K) as scratch (one thread, sequential access).
+__device__ void column_sort(u32* a, u32* tmp, int K)
+{
+    u32* src = a;
+    u32* dst = tmp;
+    for (int w = 1; w < K; w *= 2) {
+        for (int lo = 0; lo < K; lo += 2 * w) {
+            const int mid = min(lo + w, K), hi = min(lo + 2 * w, K);
+            int i = lo, j = mid, o = lo;
+            while (i < mid && j < hi) {
+                const u32 x = src[i], y = src[j];
+                if (y < x) { dst[o++] = y; ++j; } else { dst[o++] = x; ++i; }
+            }
+            while (i < mid) dst[o++] = src[i++];
+            while (j < hi)  dst[o++] = src[j++];
+        }
+        u32* t = src; src = dst; dst = t;
+    }
+    if (src != a)
+        for (int i = 0; i < K; ++i) a[i] = src[i];
+}
+
+// Sorted column (stride `stride`): replace one occurrence of `a` (guaranteed present) by `b`, keeping
+// it sorted; returns the range of indices that changed via lo_i/hi_i.
+__device__ __forceinline__ void column_replace_range(u32* col, int K, int stride, u32 a, u32 b, int& lo_i, int& hi_i)
+{
+    int p = 0, n = K;                                // branchless lower_bound: first index with col >= a
+    while (n > 1) {
+        const int half = n >> 1;
+        p = (col[(p + half) * stride] < a) ? p + half : p;
+        n -= half;
+    }
+    p += (col[p * stride] < a) ? 1 : 0;
+    const int pa = p;
+    if (b >= a) {
+        while (p < K - 1) {
+            const u32 nx = col[(p + 1) * stride];
+            if (nx > b) break;
+            col[p * stride] = nx;
+            ++p;
+        }
+    } else {
+        while (p > 0) {
+            const u32 pv = col[(p - 1) * stride];
+            if (pv <= b) break;
+            col[p * stride] = pv;
+            --p;
+        }
+    }
+    col[p * stride] = b;
+    lo_i = min(pa, p);
+    hi_i = max(pa, p);
+}
+
+// Load one G-element group of a sorted column and count its elements <= probe; `le` is the largest
+// element <= probe (valid if cntg > 0), `gt` the smallest element > probe (valid if cntg < G).
+template <int G>
+__device__ __forceinline__ void huge_group(const u32* grp, u32 probe, int& cntg, u32& le, u32& gt)
+{
+    u32 g[G];
+#pragma unroll
+    for (int q = 0; q < G / 4; ++q) {
+        const uint4 v = reinterpret_cast<const uint4*>(grp)[q];   // plain load: scratch is written in this kernel
+        g[4 * q] = v.x; g[4 * q + 1] = v.y; g[4 * q + 2] = v.z; g[4 * q + 3] = v.w;
+    }
+    cntg = 0; le = 0u; gt = 0xFFFFFFFFu;
+#pragma unroll
+    for (int i = 0; i < G; ++i) {
+        const bool b = g[i] <= probe;
+        cntg += b ? 1 : 0;
+        le = b ? g[i] : le;
+    }
+#pragma unroll
+    for (int i = G - 1; i >= 0; --i) gt = (g[i] > probe) ? g[i] : gt;
+}
+
+// ILP adjacent columns (samples at samp[j*SWs + i], data at cols + i*KP), counted in lockstep.
+template <int G, int ILP>
+__device__ __forceinline__ void huge_columns(const u32* samp, int nsamp, int SWs, const u32* cols, int KP, int K,
+                                             u32 probe, int& cnt, u32& maxLE, u32& minGT)
+{
+    int b[ILP];
+#pragma unroll
+    for (int j = 0; j < ILP; ++j) b[j] = 0;
+    for (int n = nsamp; n > 1; n -= n >> 1) {
+        const int half = n >> 1;
+#pragma unroll
+        for (int j = 0; j < ILP; ++j)
+            b[j] = (samp[(b[j] + half) * SWs + j] <= probe) ? b[j] + half : b[j];
+    }
+#pragma unroll
+    for (int j = 0; j < ILP; ++j) {
+        const int jmax = b[j] + ((samp[b[j] * SWs + j] <= probe) ? 1 : 0) - 1;   // last sample <= probe, or -1
+        if (jmax < 0) {                                                         // nothing <= probe: idx = 0
+            minGT = min(minGT, samp[j]);
+            continue;
+        }
+        int cntg;
+        u32 le, gt;
+        huge_group<G>(cols + (size_t)j * KP + jmax * G, probe, cntg, le, gt);   // cntg >= 1: group starts with a sample <= probe
+        const int idx = jmax * G + cntg;
+        cnt += idx;
+        maxLE = max(maxLE, le);
+        if (idx < K) minGT = min(minGT, (cntg < G) ? gt : samp[(jmax + 1) * SWs + j]);
+    }
+}
+
+template <int TW, int G>
+__global__ void __launch_bounds__(TW)
+medfilt_huge_kernel(const float* __restrict__ in, float* __restrict__ out, int W, int H, int K, int KP,
+                    int SWs, int rows, int nstripx, int nstrips, u32* scratch)
+{
+    extern __shared__ u32 samp[];                    // [nsamp][SWs] samples, then [SWs] column medians
+
+    const int R = K / 2, tx = threadIdx.x;
+    const int ncols = TW + K - 1;
+    const int nsamp = (K + G - 1) / G;
+    u32* medrow = samp + (size_t)nsamp * SWs;
+    u32* cols = scratch + (size_t)blockIdx.x * ncols * KP * 2;
+    u32* tmps = cols + (size_t)ncols * KP;
+    const int target = (K * K + 1) / 2;
+
+    for (int strip = blockIdx.x; strip < nstrips; strip += gridDim.x) {
+        const int x0 = (strip % nstripx) * TW, y0 = (strip / nstripx) * rows;
+        const int x = x0 + tx;
+
+        // Sorted columns + samples for the strip's first row.
+        for (int c = tx; c < ncols; c += TW) {
+            const int gx = reflect_idx(x0 + c - R, W);
+            u32* col = cols + (size_t)c * KP;
+            for (int i = 0; i < K; ++i) col[i] = f2k(__ldg(in + (size_t)reflect_idx(y0 - R + i, H) * W + gx));
+            for (int i = K; i < KP; ++i) col[i] = 0xFFFFFFFFu;
+            column_sort(col, tmps + (size_t)c * KP, K);
+            for (int j = 0; j < nsamp; ++j) samp[j * SWs + c] = col[j * G];
+            medrow[c] = col[R];
+        }
+        __syncthreads();
+
+        for (int r = 0; r < rows; ++r) {
+            const int y = y0 + r;
+            if (y >= H) break;                       // uniform across the block
+            if (r > 0) {
+                const float* row_out = in + (size_t)reflect_idx(y - 1 - R, H) * W;
+                const float* row_in  = in + (size_t)reflect_idx(y + R, H) * W;
+                for (int c = tx; c < ncols; c += TW) {
+                    const int gx = reflect_idx(x0 + c - R, W);
+                    u32* col = cols + (size_t)c * KP;
+                    int lo_i, hi_i;
+                    column_replace_range(col, K, 1, f2k(__ldg(row_out + gx)), f2k(__ldg(row_in + gx)), lo_i, hi_i);
+                    for (int j = (lo_i + G - 1) / G; j * G <= hi_i; ++j) samp[j * SWs + c] = col[j * G];
+                    if (lo_i <= R && R <= hi_i) medrow[c] = col[R];
+                }
+                __syncthreads();
+            }
+
+            if (x < W) {
+                u32 lo = 0xFFFFFFFFu, hi = 0u;       // bracket: [smallest, largest] column median
+                for (int c = 0; c < K; ++c) {
+                    const u32 m = medrow[tx + c];
+                    lo = min(lo, m);
+                    hi = max(hi, m);
+                }
+                while (lo < hi) {
+                    const u32 probe = lo + ((hi - lo) >> 1);
+                    int cnt = 0;
+                    u32 maxLE = 0u, minGT = 0xFFFFFFFFu;
+                    int c = 0;
+                    for (; c + 8 <= K; c += 8)
+                        huge_columns<G, 8>(samp + tx + c, nsamp, SWs, cols + (size_t)(tx + c) * KP, KP, K, probe, cnt, maxLE, minGT);
+                    if (c + 4 <= K) { huge_columns<G, 4>(samp + tx + c, nsamp, SWs, cols + (size_t)(tx + c) * KP, KP, K, probe, cnt, maxLE, minGT); c += 4; }
+                    if (c + 2 <= K) { huge_columns<G, 2>(samp + tx + c, nsamp, SWs, cols + (size_t)(tx + c) * KP, KP, K, probe, cnt, maxLE, minGT); c += 2; }
+                    if (c < K)        huge_columns<G, 1>(samp + tx + c, nsamp, SWs, cols + (size_t)(tx + c) * KP, KP, K, probe, cnt, maxLE, minGT);
+                    if (cnt >= target) hi = maxLE; else lo = minGT;
+                }
+                out[(size_t)y * W + x] = k2f(lo);
+            }
+            __syncthreads();                         // reads done before the next update / strip
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Kernel 4: fallback for windows that do not fit anywhere (reads through L1/L2)
 // ------------------------------------------------------------------------------------------------
 
 __global__ void __launch_bounds__(256)
@@ -453,6 +647,76 @@ cudaError_t launch_bisect(const float* in, float* out, int W, int H, int K, cuda
     return cudaGetLastError();
 }
 
+void ensure_mem_pool()
+{
+    // Keep freed device memory cached in the default pool so repeated calls do not pay for
+    // cudaMalloc/cudaFree (and their implicit synchronisation) every time.
+    static std::once_flag once;
+    std::call_once(once, [] {
+        int dev = 0;
+        cudaMemPool_t pool;
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetDefaultMemPool(&pool, dev) == cudaSuccess) {
+            unsigned long long threshold = ~0ull;   // cuuint64_t
+            cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+        }
+    });
+}
+
+// Sample group size G is the smallest (8, 16, 32, 64) whose sample table fits in shared memory.
+// `dry` only checks feasibility.
+template <int TW, int G>
+cudaError_t launch_huge(const float* in, float* out, int W, int H, int K, cudaStream_t s, bool dry)
+{
+    const int ncols = TW + K - 1;
+    const int SWs = (ncols + 31) & ~31;
+    const int nsamp = (K + G - 1) / G;
+    const size_t smem = (size_t)(nsamp + 1) * SWs * sizeof(u32);
+    if (smem > shared_mem_optin()) return cudaErrorInvalidValue;
+    if (dry) return cudaSuccess;
+
+    static bool configured = false;
+    if (!configured) {
+        cudaError_t e = cudaFuncSetAttribute(medfilt_huge_kernel<TW, G>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             (int)shared_mem_optin());
+        if (e != cudaSuccess) return e;
+        e = cudaFuncSetAttribute(medfilt_huge_kernel<TW, G>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+        if (e != cudaSuccess) return e;
+        configured = true;
+    }
+
+    // Persistent grid: as many blocks as fit on the device at once, each owning one scratch slot.
+    int per_sm = 0;
+    cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, medfilt_huge_kernel<TW, G>, TW, smem);
+    if (e != cudaSuccess) return e;
+    if (per_sm < 1) return cudaErrorInvalidValue;
+    const int resident = per_sm * device_attr(cudaDevAttrMultiProcessorCount, 16);
+    const int nstripx = (W + TW - 1) / TW;
+    int rows = 64;                                   // the first row's full column sort is amortised over these
+    while (rows > 1 && (size_t)nstripx * ((H + rows - 1) / rows) < (size_t)2 * resident) rows >>= 1;
+    const int nstrips = nstripx * ((H + rows - 1) / rows);
+    const int grid = nstrips < resident ? nstrips : resident;
+    const int KP = nsamp * G;
+
+    ensure_mem_pool();
+    u32* scratch = nullptr;
+    const size_t scratch_bytes = (size_t)grid * ncols * KP * 2 * sizeof(u32);   // columns + merge-sort temp
+    if ((e = cudaMallocAsync((void**)&scratch, scratch_bytes, s)) != cudaSuccess) return e;
+    medfilt_huge_kernel<TW, G><<<grid, TW, smem, s>>>(in, out, W, H, K, KP, SWs, rows, nstripx, nstrips, scratch);
+    e = cudaGetLastError();
+    cudaFreeAsync(scratch, s);                       // stream-ordered: released after the kernel
+    return e;
+}
+
+cudaError_t launch_huge_auto(const float* in, float* out, int W, int H, int K, cudaStream_t s, bool dry)
+{
+    cudaError_t e;
+    if ((e = launch_huge<128, 8>(in, out, W, H, K, s, dry))  != cudaErrorInvalidValue) return e;
+    if ((e = launch_huge<128, 16>(in, out, W, H, K, s, dry)) != cudaErrorInvalidValue) return e;
+    if ((e = launch_huge<128, 32>(in, out, W, H, K, s, dry)) != cudaErrorInvalidValue) return e;
+    return launch_huge<128, 64>(in, out, W, H, K, s, dry);
+}
+
 cudaError_t launch_global(const float* in, float* out, int W, int H, int K, cudaStream_t s)
 {
     const dim3 block(32, 8), grid((W + 31) / 32, (H + 7) / 8);
@@ -467,19 +731,8 @@ bool bisect_fits(int algo, int K)
     switch (algo) {
         case GPUMEDFILT_ALGO_BISECT_128: return bisect_smem_bytes<128>(K, SW) <= lim;
         case GPUMEDFILT_ALGO_BISECT_256: return bisect_smem_bytes<256>(K, SW) <= lim;
+        case GPUMEDFILT_ALGO_HUGE:       return launch_huge_auto(nullptr, nullptr, 1, 1, K, 0, true) == cudaSuccess;
         default: return false;
-    }
-}
-
-void init_mem_pool()
-{
-    // Keep freed device memory cached in the default pool so repeated calls do not pay for
-    // cudaMalloc/cudaFree (and their implicit synchronisation) every time.
-    int dev = 0;
-    cudaMemPool_t pool;
-    if (cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetDefaultMemPool(&pool, dev) == cudaSuccess) {
-        unsigned long long threshold = ~0ull;   // cuuint64_t
-        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
     }
 }
 
@@ -496,6 +749,7 @@ const char* gpumedfilt_algo_name(int algo)
         case GPUMEDFILT_ALGO_SMALL:      return "small(regs)";
         case GPUMEDFILT_ALGO_BISECT_128: return "bisect128";
         case GPUMEDFILT_ALGO_BISECT_256: return "bisect256";
+        case GPUMEDFILT_ALGO_HUGE:       return "huge";
         case GPUMEDFILT_ALGO_GLOBAL:     return "global";
         default:                         return "?";
     }
@@ -505,6 +759,7 @@ int gpumedfilt_auto_algo(int K)
 {
     if (K == 3 || K == 5 || K == 7 || K == 9) return GPUMEDFILT_ALGO_SMALL;
     if (bisect_fits(GPUMEDFILT_ALGO_BISECT_128, K)) return GPUMEDFILT_ALGO_BISECT_128;
+    if (bisect_fits(GPUMEDFILT_ALGO_HUGE, K)) return GPUMEDFILT_ALGO_HUGE;
     return GPUMEDFILT_ALGO_GLOBAL;
 }
 
@@ -525,6 +780,7 @@ cudaError_t gpumedfilt_device(const float* d_in, float* d_out, int W, int H, int
             }
         case GPUMEDFILT_ALGO_BISECT_128: return launch_bisect<128>(d_in, d_out, W, H, K, s);
         case GPUMEDFILT_ALGO_BISECT_256: return launch_bisect<256>(d_in, d_out, W, H, K, s);
+        case GPUMEDFILT_ALGO_HUGE:       return launch_huge_auto(d_in, d_out, W, H, K, s, false);
         case GPUMEDFILT_ALGO_GLOBAL:     return launch_global(d_in, d_out, W, H, K, s);
         default:                         return cudaErrorInvalidValue;
     }
@@ -551,8 +807,7 @@ extern "C" GPUMEDFILT_API void gpu_medfilt2(const float* input, float* output, i
         return;
     }
 
-    static std::once_flag once;
-    std::call_once(once, init_mem_pool);
+    ensure_mem_pool();
 
     const cudaStream_t s = cudaStreamPerThread;
     float* d_in = nullptr;

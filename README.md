@@ -49,17 +49,18 @@ compare/min/max single integer instructions and gives an exact result for every 
 |---|---|
 | 3, 5, 7, 9 | Column segments are sorted once into shared memory (optimal sorting networks) and shared by the K windows that contain them. Per pixel: sort the K rows in registers, drop the elements that provably cannot be the median of a row/column-sorted matrix, and select the median of the remaining ones (13 of 25, 29 of 49, 47 of 81) by forgetful selection. |
 | 11 … ~99 | A 128-thread block walks a 128-pixel-wide strip down the image. Sorted column segments are kept in shared memory and updated incrementally (one value out, one in) per row. Per pixel the median is found by bisection on the key value: count(≤ probe) is a binary search in each sorted column (8 columns searched in lockstep for latency hiding); the bracket is snapped to actual window elements after every probe, so it converges in about log2(#distinct values) steps. |
-| larger | Same bisection reading directly from global memory (no shared-memory limit). |
+| ~100 … ~1000 | Same scheme with the sorted columns in a global-memory scratch buffer (persistent blocks, one scratch slot each). Shared memory holds every G-th element of every column (G = 8…64), so each probe does the binary search in shared memory and then reads a single G-element group (one or a few 32-byte sectors) per column from global memory. |
+| larger | Same bisection reading the raw window directly from global memory (no size limit). |
 
 Kernel times on an RTX 4070 for a 4096×2160 image (host↔device copies of 35 MB each add ~6.5 ms
 in total at pageable-memory PCIe speed and dominate the end-to-end time for small filters):
 
-| K | 3 | 5 | 7 | 9 | 11 | 15 | 21 | 31 | 63 |
-|---|---|---|---|---|---|---|---|---|---|
-| ms | 0.17 | 0.31 | 0.86 | 1.9 | 3.0 | 4.8 | 7.0 | 10.5 | 28 |
+| K | 3 | 5 | 7 | 9 | 11 | 15 | 21 | 31 | 63 | 101 | 201 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ms | 0.17 | 0.31 | 0.86 | 1.9 | 3.0 | 4.8 | 7.0 | 10.5 | 28 | 160 | 280 |
 
-(8-bit-like content; uniformly random floats are 10–60 % slower at K ≥ 11 because they need more
-bisection steps.)
+(8-bit-like content; uniformly random floats are 10–110 % slower at K ≥ 11 because they need more
+bisection steps: 0.59 s instead of 0.28 s at K = 201.)
 
 NPP's `nppiFilterMedianBorder_32f_C1R` was evaluated as an alternative: it is no faster for 3×3/5×5,
 its border modes do not implement symmetric reflection, and on this toolkit (13.3) it fails with an

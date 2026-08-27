@@ -10,8 +10,9 @@ enum gpumedfilt_algo {
     GPUMEDFILT_ALGO_SMALL      = 1,  /* sorted columns + row sort + candidate pruning in registers (K = 3,5,7,9) */
     GPUMEDFILT_ALGO_BISECT_128 = 2,  /* incremental sorted columns + snapping bisection, 128-wide strip */
     GPUMEDFILT_ALGO_BISECT_256 = 3,  /* same, 256-wide strip */
-    GPUMEDFILT_ALGO_GLOBAL     = 4,  /* no shared memory, any K (fallback) */
-    GPUMEDFILT_ALGO_COUNT      = 5
+    GPUMEDFILT_ALGO_HUGE       = 4,  /* sorted columns in global scratch + sample table in shared memory (K up to ~1000) */
+    GPUMEDFILT_ALGO_GLOBAL     = 5,  /* no shared memory, any K (fallback) */
+    GPUMEDFILT_ALGO_COUNT      = 6
 };
 
 /* Median filter on device buffers (row-major, width*height floats each), asynchronous on `stream`.
